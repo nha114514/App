@@ -1,5 +1,6 @@
 import {act, fireEvent, render, screen} from '@testing-library/react-native';
 
+import CarouselItem from '@components/Attachments/AttachmentCarousel/CarouselItem';
 import ComposeProviders from '@components/ComposeProviders';
 import {CurrencyListContextProvider} from '@components/CurrencyListContextProvider';
 import {CurrentUserPersonalDetailsProvider} from '@components/CurrentUserPersonalDetailsProvider';
@@ -22,6 +23,7 @@ import PaymentContent from '@pages/inbox/report/actionContents/PaymentContent';
 import ReportActionItem from '@pages/inbox/report/ReportActionItem';
 import ReportActionItemMessage from '@pages/inbox/report/ReportActionItemMessage';
 import ReportActionItemParentAction from '@pages/inbox/report/ReportActionItemParentAction';
+import {AttachmentModalContextProvider} from '@pages/media/AttachmentModalScreen/AttachmentModalContext';
 
 import colors from '@styles/theme/colors';
 
@@ -147,10 +149,18 @@ describe('ReportActionItem', () => {
         await waitForBatchedUpdatesWithAct();
     });
 
-    function renderItemWithAction(action: ReportAction, isLatestConciergeFeedbackAction = false, report?: Report) {
-        return render(
+    function renderItemWithAction(initialAction: ReportAction, isLatestConciergeFeedbackAction = false, report?: Report) {
+        const buildItem = (action: ReportAction, carouselItem?: React.JSX.Element) => (
             <ComposeProviders
-                components={[OnyxListItemProvider, CurrentUserPersonalDetailsProvider, LocaleContextProvider, CurrencyListContextProvider, HTMLEngineProvider, PlaybackContextProvider]}
+                components={[
+                    OnyxListItemProvider,
+                    CurrentUserPersonalDetailsProvider,
+                    LocaleContextProvider,
+                    CurrencyListContextProvider,
+                    HTMLEngineProvider,
+                    PlaybackContextProvider,
+                    AttachmentModalContextProvider,
+                ]}
             >
                 <ScreenWrapper testID="test">
                     <PortalProvider>
@@ -166,10 +176,16 @@ describe('ReportActionItem', () => {
                             isFirstVisibleReportAction={false}
                             isLatestConciergeFeedbackAction={isLatestConciergeFeedbackAction}
                         />
+                        {carouselItem}
                     </PortalProvider>
                 </ScreenWrapper>
-            </ComposeProviders>,
+            </ComposeProviders>
         );
+        const rendered = render(buildItem(initialAction));
+        return {
+            ...rendered,
+            rerenderAction: (action: ReportAction, carouselItem?: React.JSX.Element) => rendered.rerender(buildItem(action, carouselItem)),
+        };
     }
 
     describe('Bill Pay creation and submission history', () => {
@@ -4288,6 +4304,96 @@ describe('ReportActionItem', () => {
             await waitForBatchedUpdatesWithAct();
 
             expect(screen.getByText(prompt())).toBeOnTheScreen();
+        });
+    });
+
+    describe('Flagged attachment visibility', () => {
+        const attachmentName = 'flagged.png';
+
+        function createFlaggedAttachment(reportActionID: string, decision: DecisionName = CONST.MODERATION.MODERATOR_DECISION_PENDING_HIDE) {
+            const url = `https://www.expensify.com/chat-attachments/${reportActionID}/${attachmentName}`;
+            const html = `<img src="${url}" data-expensify-source="${url}" alt="${attachmentName}" />`;
+            return {
+                ...createReportAction(CONST.REPORT.ACTIONS.TYPE.ADD_COMMENT, {}),
+                reportActionID,
+                message: [{type: 'COMMENT', html, text: '[Attachment]', moderationDecision: {decision}}],
+            } satisfies ReportAction;
+        }
+
+        async function renderRevealedAttachment(reportActionID = '12345') {
+            const action = createFlaggedAttachment(reportActionID);
+            const {rerenderAction} = renderItemWithAction(action);
+            await waitForBatchedUpdatesWithAct();
+            fireEvent.press(screen.getByText('Reveal message'));
+            expect(screen.getByLabelText(attachmentName)).toBeOnTheScreen();
+            return {action, rerenderAction};
+        }
+
+        it('keeps a revealed attachment visible when the reaction response refreshes the message', async () => {
+            // Given the recipient explicitly revealed a flagged attachment
+            const {action, rerenderAction} = await renderRevealedAttachment();
+
+            // When the reaction response replaces the message array with the same moderation decision
+            rerenderAction({...action, message: action.message.map((message) => ({...message})), lastModified: '2025-07-12 09:03:18.653'});
+            await waitForBatchedUpdatesWithAct();
+
+            // Then the recipient's choice still applies after the update
+            expect(screen.getByLabelText(attachmentName)).toBeOnTheScreen();
+            expect(screen.getByText('Hide message')).toBeOnTheScreen();
+        });
+
+        it('preserves the reveal for the same attachment in the carousel after a reaction update', async () => {
+            // Given the recipient revealed the attachment in chat and opened its carousel item
+            const {action, rerenderAction} = await renderRevealedAttachment();
+            const buildCarouselItem = (reportActionID: string) => (
+                <CarouselItem
+                    key={reportActionID}
+                    item={{reportActionID, attachmentID: `${reportActionID}_1`, source: attachmentName, hasBeenFlagged: true}}
+                    isFocused
+                />
+            );
+            rerenderAction(action, buildCarouselItem(action.reportActionID));
+            expect(screen.getByTestId('moderationButton')).toHaveTextContent('Hide message');
+
+            // When the same message is refreshed by a reaction and the viewer moves to another attachment
+            const updatedAction = {...action, message: [...action.message]};
+            rerenderAction(updatedAction, buildCarouselItem(action.reportActionID));
+            await waitForBatchedUpdatesWithAct();
+            expect(screen.getByLabelText(attachmentName)).toBeOnTheScreen();
+            expect(screen.getByTestId('moderationButton')).toHaveTextContent('Hide message');
+            rerenderAction(updatedAction, buildCarouselItem('12346'));
+
+            // Then the other flagged attachment remains hidden until the recipient reveals it
+            expect(screen.getByTestId('moderationButton')).toHaveTextContent('Reveal message');
+        });
+
+        it('does not carry a reveal over to another flagged message when the row is reused', async () => {
+            // Given the recipient revealed a flagged attachment in this row
+            const {rerenderAction} = await renderRevealedAttachment();
+
+            // When the row is reused for a different attachment with the same moderation decision
+            rerenderAction(createFlaggedAttachment('12346'));
+            await waitForBatchedUpdatesWithAct();
+
+            // Then the second attachment needs its own reveal
+            expect(screen.getByText('Reveal message')).toBeOnTheScreen();
+            expect(screen.queryByLabelText(attachmentName)).not.toBeOnTheScreen();
+        });
+
+        it('requires a fresh reveal after the moderation decision changes', async () => {
+            // Given the recipient revealed an attachment that is pending review
+            const {action, rerenderAction} = await renderRevealedAttachment();
+
+            // When a moderator hides it and the decision eventually returns to pending review
+            rerenderAction(createFlaggedAttachment(action.reportActionID, CONST.MODERATION.MODERATOR_DECISION_HIDDEN));
+            await waitForBatchedUpdatesWithAct();
+            expect(screen.getByText('Reveal message')).toBeOnTheScreen();
+            rerenderAction(action);
+            await waitForBatchedUpdatesWithAct();
+
+            // Then the previous reveal does not become active again
+            expect(screen.getByText('Reveal message')).toBeOnTheScreen();
+            expect(screen.queryByLabelText(attachmentName)).not.toBeOnTheScreen();
         });
     });
 
